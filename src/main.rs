@@ -5,11 +5,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use crossbeam::channel::{bounded, Receiver};
 
 // Configuration parameters
 const AUDIO_TX_RATE: u32 = 11525;
 const SERIAL_PORT: &str = "/dev/ttyUSB0";
 const SERIAL_BAUD_RATE: u32 = 115200;
+const BUFFER_SIZE: usize = 500;
+const SERIAL_TIMEOUT_MS: u64 = 10;
 
 // Shared state
 struct SharedState {
@@ -18,18 +21,16 @@ struct SharedState {
     tx_status: bool,
 }
 
-fn receive_serial_audio(serport: Box<dyn SerialPort>, state: Arc<Mutex<SharedState>>) {
+fn receive_serial_audio(serport: Box<dyn SerialPort>, tx: crossbeam::channel::Sender<Vec<u8>>) {
     let mut serport = serport;
-    let mut buffer = [0u8; 500];
+    let mut buffer = [0u8; BUFFER_SIZE];
     loop {
         match serport.read(&mut buffer) {
             Ok(bytes_read) => {
-                let mut state = state.lock().unwrap();
-                state.buf.extend_from_slice(&buffer[..bytes_read]);
+                tx.send(buffer[..bytes_read].to_vec()).expect("Failed to send data");
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // No data yet, just wait
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(SERIAL_TIMEOUT_MS));
             }
             Err(e) => {
                 eprintln!("Serial read error: {:?}", e);
@@ -39,67 +40,35 @@ fn receive_serial_audio(serport: Box<dyn SerialPort>, state: Arc<Mutex<SharedSta
     }
 }
 
-fn play_receive_audio(state: Arc<Mutex<SharedState>>, sink: Sink) {
+fn play_receive_audio(rx: Receiver<Vec<u8>>, sink: Sink) {
     loop {
-        let mut state_guard = state.lock().unwrap();
-        if state_guard.buf.len() < 2 {
-            println!("UNDERRUN #{} - refilling", state_guard.underrun_counter);
-            state_guard.underrun_counter += 1;
-            while state_guard.buf.len() < 10 {
-                drop(state_guard);
-                thread::sleep(Duration::from_millis(10));
-                state_guard = state.lock().unwrap();
+        match rx.recv() {
+            Ok(data) => {
+                if data.len() < 2 {
+                    println!("UNDERRUN - refilling");
+                }
+                let cursor = Cursor::new(data);
+                let source = Decoder::new(cursor).unwrap().convert_samples::<f32>();
+                sink.append(source);
             }
+            Err(_) => break,
         }
-        if let Some(data) = state_guard.buf.drain(..500).collect::<Vec<u8>>().get(0..500) {
-            let cursor = Cursor::new(data.to_vec());
-            let source = Decoder::new(cursor).unwrap().convert_samples::<f32>();
-            sink.append(source);
-        }
-    }
-}
-
-fn transmit_audio_via_serial(
-    input_data: &[u8],
-    mut serport: Box<dyn SerialPort>,
-    state: Arc<Mutex<SharedState>>,
-) {
-    let mut buffer = Vec::new();
-    loop {
-        buffer.extend_from_slice(input_data);
-
-        let min_sample = buffer.iter().cloned().min().unwrap_or(128);
-        let max_sample = buffer.iter().cloned().max().unwrap_or(128);
-
-        let mut state = state.lock().unwrap();
-        if min_sample != 128 || max_sample != 128 {
-            if !state.tx_status {
-                state.tx_status = true;
-                println!("TX ON");
-                serport.write(b"UA1;TX0;").unwrap();
-            }
-            serport.write(&buffer).unwrap();
-            println!("{}, {}, {}", buffer.len(), min_sample, max_sample);
-        } else if state.tx_status {
-            thread::sleep(Duration::from_millis(100));
-            serport.write(b";RX;").unwrap();
-            state.tx_status = false;
-            println!("TX OFF");
-        }
-        buffer.clear();
     }
 }
 
 fn main() {
+    // Initialize shared state and channel
     let state = Arc::new(Mutex::new(SharedState {
         buf: Vec::new(),
         underrun_counter: 0,
         tx_status: false,
     }));
 
+    let (tx, rx) = bounded(10);
+
     // Open serial port
     let mut serport = serialport::new(SERIAL_PORT, SERIAL_BAUD_RATE)
-        .timeout(Duration::from_millis(10))
+        .timeout(Duration::from_millis(SERIAL_TIMEOUT_MS))
         .open()
         .expect("Failed to open serial port");
 
@@ -107,57 +76,12 @@ fn main() {
     let (_stream, stream_handle) = OutputStream::try_default().unwrap();
     let sink = Sink::try_new(&stream_handle).unwrap();
 
-    // Set up audio input using cpal
-    let host = cpal::default_host();
-    let input_device = host.default_input_device().expect("No input device available");
-
-    let input_config = cpal::StreamConfig {
-        channels: 1,
-        sample_rate: cpal::SampleRate(AUDIO_TX_RATE),
-        buffer_size: cpal::BufferSize::Default,
-    };
-
-    // Buffer to store input data
-    let input_data: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-
-    let input_data_clone = input_data.clone();
-    let stream = input_device.build_input_stream(
-        &input_config,
-        move |data: &[u8], _: &cpal::InputCallbackInfo| {
-            let mut input_data = input_data_clone.lock().unwrap();
-            input_data.extend_from_slice(data);
-        },
-        move |err| {
-            eprintln!("An error occurred on input stream: {}", err);
-        },
-        None,
-    ).unwrap();
-
-    // Start the input stream
-    stream.play().unwrap();
-
-    // Wait for device to start after opening serial port
-    thread::sleep(Duration::from_secs(3));
-    serport.write(b"UA1;").unwrap(); // Enable audio streaming
-
-    // Cloning state and serial port to pass to threads
-    let state_rx = Arc::clone(&state);
-    let state_play = Arc::clone(&state);
-    let state_tx = Arc::clone(&state);
+    // Start receiving and playing audio
     let serport_clone = serport.try_clone().expect("Failed to clone serial port");
+    thread::spawn(move || receive_serial_audio(serport_clone, tx));
+    thread::spawn(move || play_receive_audio(rx, sink));
 
-    // Threads for handling different tasks
-    thread::spawn(move || receive_serial_audio(serport_clone, state_rx));
-    thread::spawn(move || play_receive_audio(state_play, sink));
-
-    // Using the cpal input data for transmit
-    let input_data_clone = input_data.clone();
-    thread::spawn(move || {
-        let input_data = input_data_clone.lock().unwrap();
-        transmit_audio_via_serial(&input_data, serport, state_tx);
-    });
-
-    // Display some stats every 10 seconds
+    // Main loop for stats
     let start_time = Instant::now();
     loop {
         thread::sleep(Duration::from_secs(10));
