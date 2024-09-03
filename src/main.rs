@@ -41,14 +41,14 @@ fn receive_serial_audio(serport: Box<dyn SerialPort>, state: Arc<Mutex<SharedSta
 
 fn play_receive_audio(state: Arc<Mutex<SharedState>>, sink: Sink) {
     loop {
-        let mut state_guard = state.lock().unwrap(); // Correct usage of lock
+        let mut state_guard = state.lock().unwrap();
         if state_guard.buf.len() < 2 {
             println!("UNDERRUN #{} - refilling", state_guard.underrun_counter);
             state_guard.underrun_counter += 1;
             while state_guard.buf.len() < 10 {
-                drop(state_guard); // Release lock
+                drop(state_guard);
                 thread::sleep(Duration::from_millis(10));
-                state_guard = state.lock().unwrap(); // Lock again
+                state_guard = state.lock().unwrap();
             }
         }
         if let Some(data) = state_guard.buf.drain(..500).collect::<Vec<u8>>().get(0..500) {
@@ -130,7 +130,7 @@ fn main() {
         move |err| {
             eprintln!("An error occurred on input stream: {}", err);
         },
-        None, // Optional latency argument, use None for default latency
+        None,
     ).unwrap();
 
     // Start the input stream
