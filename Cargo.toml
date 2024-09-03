@@ -1,0 +1,10 @@
+[package]
+name = "rustysdx-audio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serialport = "4.0"  # Update to the latest or compatible version
+rodio = "0.14"
+cpal = "0.15"
+crossbeam = "0.8"
